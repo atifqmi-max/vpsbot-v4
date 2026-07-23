@@ -323,9 +323,22 @@ async def start_agent_server():
     app.router.add_get("/agent/ws", ws_agent_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", AGENT_PORT)
-    await site.start()
-    log.info(f"Node-agent WebSocket server listening on 0.0.0.0:{AGENT_PORT}")
+    site = web.TCPSite(runner, "0.0.0.0", AGENT_PORT, reuse_address=True)
+    try:
+        await site.start()
+        log.info(f"Node-agent WebSocket server listening on 0.0.0.0:{AGENT_PORT}")
+    except OSError as e:
+        if e.errno == 98:  # Address already in use
+            log.error(
+                f"❌ Port {AGENT_PORT} is already in use — the node-agent server "
+                f"did NOT start (Discord bot will still run normally otherwise).\n"
+                f"   This usually means an old copy of this bot is still running. Fix with:\n"
+                f"     sudo lsof -i :{AGENT_PORT}      # find the PID using this port\n"
+                f"     sudo kill -9 <PID>              # stop it\n"
+                f"   Or set a different AGENT_PORT in your .env and restart."
+            )
+        else:
+            log.error(f"❌ Node-agent server failed to start: {e}")
 
 def next_id() -> str:
     with get_db() as c:
