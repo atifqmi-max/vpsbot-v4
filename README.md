@@ -124,8 +124,8 @@ Requires=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/vpsbot-v4
-ExecStart=/path/to/vpsbot-v4/venv/bin/python3 stonenodes_bot.py
+WorkingDirectory=/root/vpsbot-v4
+ExecStart=/root/vpsbot-v4/venv/bin/python3 stonenodes_bot.py
 Restart=always
 RestartSec=5
 
