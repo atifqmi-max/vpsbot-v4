@@ -38,7 +38,7 @@ physical server, all from one bot.
 ### 1. Clone the repository
 
 ```bash
-https://github.com/mayankhuuu/vpsbot-v4.git
+git clone https://github.com/mayankhuuu/vpsbot-v4.git
 cd vpsbot-v4
 ```
 
