@@ -866,7 +866,7 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
 intents         = discord.Intents.default()
 intents.members = True
 
-class StoneNodesBot(commands.Bot):
+class NETHOST(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
 
