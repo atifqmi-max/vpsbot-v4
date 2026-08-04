@@ -1,4 +1,4 @@
-# StoneNodes VPS Manager Bot (v4)
+# NETHOST VPS Manager Bot (v4)
 
 A Discord bot that deploys and manages Docker-based VPS containers, with full
 `systemctl` support, **direct root SSH access** (real IP, port, username, and
@@ -38,7 +38,7 @@ physical server, all from one bot.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/atifqmi-max/vpsbot-v4.git
+git clone https://github.com/mayankhuuu/vpsbot-v4.git
 cd vpsbot-v4
 ```
 
@@ -114,7 +114,7 @@ Starting StoneNodes VPS Manager...
 
 ### 8. Keep it running 24/7
 
-Create `/etc/systemd/system/stonenodes.service`:
+Create `/etc/systemd/system/NETHOST.service`:
 
 ```ini
 [Unit]
@@ -125,7 +125,7 @@ Requires=docker.service
 [Service]
 Type=simple
 WorkingDirectory=/root/vpsbot-v4
-ExecStart=/root/vpsbot-v4/venv/bin/python3 stonenodes_bot.py
+ExecStart=/root/vpsbot-v4/venv/bin/python3 NETHOST_bot.py
 Restart=always
 RestartSec=5
 
@@ -254,10 +254,10 @@ sudo python3 node_agent.py     # choose 3, paste connect string
 # Ctrl+B then D to detach — it keeps running
 ```
 
-**systemd (recommended for production):** create `/etc/systemd/system/stonenodes-agent.service`:
+**systemd (recommended for production):** create `/etc/systemd/system/NETHOST-agent.service`:
 ```ini
 [Unit]
-Description=StoneNodes Node Agent
+Description=NETHOST Node Agent
 After=docker.service network.target
 
 [Service]

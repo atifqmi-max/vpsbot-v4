@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════╗
-║           StoneNodes VPS Manager Bot                  ║
+║           NETHOST VPS Manager Bot                  ║
 ║  Server: 180GB RAM | 94 Core CPU | Docker + systemd  ║
 ║  • Docker-in-Docker VPS containers                   ║
 ║  • Full systemctl support                            ║
@@ -66,7 +66,7 @@ GREEN  = 0x57F287
 RED    = 0xED4245
 YELLOW = 0xFEE75C
 DARK   = 0x2F3136
-FOOTER = "Powered by StoneNodes"
+FOOTER = "Powered by NETHOST"
 
 # ─────────────────────────────────────────────────────
 # OS + CPU
@@ -347,16 +347,16 @@ def next_id() -> str:
     dk_max = 0
     try:
         for ct in get_docker().containers.list(
-            all=True, filters={"label": "managed-by=stonenodes"}
+            all=True, filters={"label": "managed-by=NETHOST"}
         ):
-            if ct.name.startswith("stonenodes-vps-"):
+            if ct.name.startswith("NETHOST-vps-"):
                 try:
                     dk_max = max(dk_max, int(ct.name.split("-")[-1]))
                 except ValueError:
                     pass
     except Exception:
         pass
-    return f"stonenodes-vps-{max(db_num, dk_max + 1):04d}"
+    return f"NETHOST-vps-{max(db_num, dk_max + 1):04d}"
 
 def gb(b): return round(b / 1024**3, 2)
 
@@ -565,7 +565,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         command="/sbin/init",
         host_config=host_cfg,
         ports=[22],
-        labels={"managed-by": "stonenodes", "vps-id": vps_id},
+        labels={"managed-by": "NETHOST", "vps-id": vps_id},
     )
     client.api.start(ct_data["Id"])
     ct = client.containers.get(ct_data["Id"])
@@ -588,21 +588,21 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     )
 
     # ── Step 7: Fake /proc/meminfo and /proc/cpuinfo ─────────────────
-    ct.exec_run("mkdir -p /etc/stonenodes", tty=False)
+    ct.exec_run("mkdir -p /etc/NETHOST", tty=False)
 
     write_file(ct, "/etc/stonenodes/meminfo", fake_meminfo(ram_mb))
-    r = ct.exec_run("mount --bind /etc/stonenodes/meminfo /proc/meminfo", tty=False)
+    r = ct.exec_run("mount --bind /etc/NETHOST/meminfo /proc/meminfo", tty=False)
     log.info(f"[{vps_id}] meminfo bind mount: exit={r.exit_code}")
 
     write_file(ct, "/etc/stonenodes/cpuinfo", fake_cpuinfo(cpu_cores, cpu_name))
-    r = ct.exec_run("mount --bind /etc/stonenodes/cpuinfo /proc/cpuinfo", tty=False)
+    r = ct.exec_run("mount --bind /etc/NETHOST/cpuinfo /proc/cpuinfo", tty=False)
     log.info(f"[{vps_id}] cpuinfo bind mount: exit={r.exit_code}")
 
     # Re-apply mounts on container restart
     write_file(ct, "/etc/rc.local",
         "#!/bin/bash\n"
-        "mount --bind /etc/stonenodes/meminfo /proc/meminfo 2>/dev/null\n"
-        "mount --bind /etc/stonenodes/cpuinfo /proc/cpuinfo 2>/dev/null\n"
+        "mount --bind /etc/NETHOST/meminfo /proc/meminfo 2>/dev/null\n"
+        "mount --bind /etc/NETHOST/cpuinfo /proc/cpuinfo 2>/dev/null\n"
         "exit 0\n"
     )
     ct.exec_run("chmod +x /etc/rc.local", tty=False)
@@ -617,7 +617,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     write_file(ct, "/etc/motd",
         f"\n"
         f"  ╔══════════════════════════════════╗\n"
-        f"  ║        🐉  StoneNodes VPS           ║\n"
+        f"  ║        🐉  NETHOST VPS           ║\n"
         f"  ╠══════════════════════════════════╣\n"
         f"  ║  VPS ID : {vps_id:<24}║\n"
         f"  ║  RAM    : {str(ram_mb)+' MB':<24}║\n"
@@ -866,7 +866,7 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
 intents         = discord.Intents.default()
 intents.members = True
 
-class StoneNodesBot(commands.Bot):
+class NETHOST(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
 
@@ -885,7 +885,7 @@ class StoneNodesBot(commands.Bot):
 bot = StoneNodesBot()
 
 # ─────────────────────────────────────────────────────
-# LIVE STATUS TASK — "StoneNodes | {n} VPS Running"
+# LIVE STATUS TASK — "NETHOST | {n} VPS Running"
 # ─────────────────────────────────────────────────────
 @tasks.loop(minutes=2)
 async def update_status():
@@ -941,7 +941,7 @@ async def _before(): await bot.wait_until_ready()
 # ══════════════════════════════════════════════
 
 @bot.tree.command(name="start", description="Start your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. NETHOST-vps-0001")
 async def cmd_start(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -964,7 +964,7 @@ async def cmd_start(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="stop", description="Stop your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. NETHOST-vps-0001")
 async def cmd_stop(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -981,7 +981,7 @@ async def cmd_stop(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="restart", description="Restart your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. NETHOST-vps-0001")
 async def cmd_restart(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1045,7 +1045,7 @@ async def cmd_reinstall(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="regen-ssh", description="Get a fresh tmate SSH session.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. NETHOST-vps-0001")
 async def cmd_regen(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1663,7 +1663,7 @@ async def cmd_ptero(ix: discord.Interaction):
 # 1-CLICK DEPLOY
 # ══════════════════════════════════════════════
 
-class DeployModal(discord.ui.Modal, title="🐉 StoneNodes — Deploy VPS"):
+class DeployModal(discord.ui.Modal, title="🐉 NETHOST — Deploy VPS"):
     ram  = discord.ui.TextInput(label="RAM (MB)",  placeholder="512",  default="512", min_length=1, max_length=7)
     cpu  = discord.ui.TextInput(label="CPU Cores", placeholder="1",    default="1",   min_length=1, max_length=5)
     disk = discord.ui.TextInput(label="Disk (GB)", placeholder="10",   default="10",  min_length=1, max_length=5)
