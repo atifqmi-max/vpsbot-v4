@@ -743,7 +743,7 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
             ("💻 CPU",       f"{cpu} Core(s)",                  True),
             ("💾 Disk",      f"{disk} GB",                      True),
             ("🏷 CPU Model", cpu_name,                          False),
-            ("📡 Node",      node_id or "Local (this server)",  False),
+            ("📡 Node",      node_id or "N1 (This Server)",  False),
             ("⏰ Expiry",    exp_note,                          False),
         ],
     ))
@@ -1197,7 +1197,7 @@ async def cmd_rm(ix: discord.Interaction, user: discord.Member):
 async def node_autocomplete(ix: discord.Interaction, current: str):
     with get_db() as c:
         rows = c.execute("SELECT node_id, status FROM nodes").fetchall()
-    choices = [app_commands.Choice(name="Local (this server)", value="local")]
+    choices = [app_commands.Choice(name="🟢 N1 (This Server)", value="local")]
     for r in rows:
         label = f"{r['node_id']} ({'🟢 online' if r['status']=='online' else '🔴 offline'})"
         choices.append(app_commands.Choice(name=label, value=r["node_id"]))
@@ -1601,7 +1601,7 @@ async def cmd_node_list(ix: discord.Interaction):
             "SELECT COUNT(*) AS n FROM vps WHERE node_id IS NULL"
         ).fetchone()["n"]
 
-    lines = [f"🏠 **Local (this server)** — {local_count} VPS"]
+    lines = [f"🟢 **N1 (This Server)** — {local_count} VPS — `{SERVER_IP}`"]
     for r in rows:
         dot = "🟢 online" if node_is_online(r["node_id"]) else "🔴 offline"
         lines.append(
@@ -1747,49 +1747,68 @@ class CPUView(discord.ui.View):
         await ix.response.edit_message(embed=em("❌ Cancelled", "Deployment cancelled.", RED), view=None)
 
 
-class NodeSelect(discord.ui.Select):
-    def __init__(self, target: discord.Member, os_key: str, cpu_key: str):
-        self.target, self.os_key, self.cpu_key = target, os_key, cpu_key
-        with get_db() as c:
-            rows = c.execute("SELECT node_id, status FROM nodes").fetchall()
-        options = [discord.SelectOption(label="Local (this server)", value="local", emoji="🏠", default=True)]
-        for r in rows:
-            options.append(discord.SelectOption(
-                label=r["node_id"],
-                value=r["node_id"],
-                emoji="🟢" if r["status"] == "online" else "🔴",
-                description="Online" if r["status"] == "online" else "Offline — cannot deploy here",
-            ))
-        super().__init__(placeholder="Select a node...", options=options[:25])
-
-    async def callback(self, ix: discord.Interaction):
-        if not is_admin(ix):
-            return await ix.response.send_message(embed=em("⛔ Forbidden", "Admin only.", RED), ephemeral=True)
-        chosen = self.values[0]
-        node_id = None if chosen == "local" else chosen
-        if node_id and not node_is_online(node_id):
-            return await ix.response.send_message(
-                embed=em("❌ Node Offline", f"**{node_id}** is offline right now. Pick another node.", RED),
-                ephemeral=True)
-        await ix.response.send_modal(DeployModal(self.target, self.os_key, self.cpu_key, node_id))
-
-
 class NodeView(discord.ui.View):
+    """Buttons for node selection — one button per node + N1 (local)."""
+
     def __init__(self, target: discord.Member, os_key: str, cpu_key: str):
         super().__init__(timeout=120)
-        self.add_item(NodeSelect(target, os_key, cpu_key))
+        self.target  = target
+        self.os_key  = os_key
+        self.cpu_key = cpu_key
+        self._build_buttons()
 
-    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back(self, ix: discord.Interaction, b):
-        os_key = self.children[0].os_key
-        target = self.children[0].target
+    def _build_buttons(self):
+        # Always add N1 (local server) first
+        self._add_node_button("N1 (This Server)", "local", online=True, row=0)
+
+        with get_db() as c:
+            rows = c.execute("SELECT node_id, status FROM nodes ORDER BY node_id").fetchall()
+
+        row_index = 0
+        for i, r in enumerate(rows):
+            if i > 0 and i % 4 == 0:       # max 4 remote nodes per row
+                row_index += 1
+            if row_index > 2:               # Discord max 5 rows; keep last 2 for Back/Cancel
+                break
+            online = node_is_online(r["node_id"])
+            self._add_node_button(r["node_id"], r["node_id"], online=online, row=row_index)
+
+        # Back & Cancel always on last row
+        back_btn   = discord.ui.Button(label="◀ Back",  style=discord.ButtonStyle.secondary, row=3)
+        cancel_btn = discord.ui.Button(label="Cancel",  style=discord.ButtonStyle.danger,    row=3, emoji="✖️")
+        back_btn.callback   = self._back
+        cancel_btn.callback = self._cancel
+        self.add_item(back_btn)
+        self.add_item(cancel_btn)
+
+    def _add_node_button(self, label: str, value: str, online: bool, row: int):
+        style = discord.ButtonStyle.success if online else discord.ButtonStyle.secondary
+        emoji = "🟢" if online else "🔴"
+        btn   = discord.ui.Button(label=label, style=style, emoji=emoji, row=row, disabled=not online)
+
+        async def callback(ix: discord.Interaction, _value=value, _label=label, _online=online):
+            if not is_admin(ix):
+                return await ix.response.send_message(
+                    embed=em("⛔ Forbidden", "Admin only.", RED), ephemeral=True)
+            if not _online:
+                return await ix.response.send_message(
+                    embed=em("❌ Node Offline", f"**{_label}** is offline. Pick an online node.", RED),
+                    ephemeral=True)
+            node_id = None if _value == "local" else _value
+            await ix.response.send_modal(DeployModal(self.target, self.os_key, self.cpu_key, node_id))
+
+        btn.callback = callback
+        self.add_item(btn)
+
+    async def _back(self, ix: discord.Interaction):
         await ix.response.edit_message(
             embed=em("🐉 Deploy — Step 2/4", "Choose **CPU**:", BLUE),
-            view=CPUView(target, os_key),
+            view=CPUView(self.target, self.os_key),
         )
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️", row=1)
-    async def cancel(self, ix: discord.Interaction, b):
-        await ix.response.edit_message(embed=em("❌ Cancelled", "Deployment cancelled.", RED), view=None)
+
+    async def _cancel(self, ix: discord.Interaction):
+        await ix.response.edit_message(
+            embed=em("❌ Cancelled", "Deployment cancelled.", RED), view=None)
 
 
 @bot.tree.command(name="deploy", description="[Admin] 1-click VPS deploy.")
