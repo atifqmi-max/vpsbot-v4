@@ -291,14 +291,17 @@ async def agent_loop(node_id, token, server_ip, port):
                         jtype = job.get("type")
                         print(f"[agent] Job received: {jtype} ({job.get('vps_id')})")
 
-                        if jtype == "create_vps":
-                            loop = asyncio.get_event_loop()
-                            result = await loop.run_in_executor(None, provision_vps, job)
-                        elif jtype == "exec_action":
-                            loop = asyncio.get_event_loop()
-                            result = await loop.run_in_executor(None, exec_action, job)
-                        else:
-                            result = {"ok": False, "error": f"Unknown job type '{jtype}'"}
+                        try:
+                            loop = asyncio.get_running_loop()
+                            if jtype == "create_vps":
+                                result = await loop.run_in_executor(None, provision_vps, job)
+                            elif jtype == "exec_action":
+                                result = await loop.run_in_executor(None, exec_action, job)
+                            else:
+                                result = {"ok": False, "error": f"Unknown job type '{jtype}'"}
+                        except Exception as job_err:
+                            print(f"[agent] ❌ Job error: {job_err}")
+                            result = {"ok": False, "error": str(job_err)}
 
                         result["type"] = "job_result"
                         result["job_id"] = job["job_id"]
