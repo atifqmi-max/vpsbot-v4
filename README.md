@@ -251,6 +251,7 @@ stops it (and the node goes offline). Use either:
 ```bash
 tmux new -s stonenodes-agent
 sudo python3 node_agent.py     # choose 3, paste connect string
+tmux attach -t stonenodes-agent # for alredy tmux
 # Ctrl+B then D to detach — it keeps running
 ```
 
