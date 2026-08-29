@@ -13,6 +13,7 @@
 """
 
 import os, io, time, socket, random, string, secrets, uuid, tarfile, asyncio, logging, sqlite3, datetime
+import concurrent.futures
 import discord, docker, psutil, requests, aiohttp
 from aiohttp import web
 from discord import app_commands
@@ -581,8 +582,10 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     # ── Step 6: Install packages ─────────────────────────────────────
     log.info(f"[{vps_id}] Installing openssh-server, tmate, neofetch, tools...")
+    ct.exec_run("bash -c 'apt-get update -qq'", tty=False, socket=False)
     ct.exec_run(
         "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+        "--no-install-recommends "
         "openssh-server tmate neofetch curl wget sudo procps net-tools iproute2 htop'",
         tty=False,
     )
@@ -647,15 +650,29 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     )
     log.info(f"[{vps_id}] sshd restart exit={r.exit_code}")
 
-    # ── Step 10: tmate SSH session (kept as backup access method) ────
-    log.info(f"[{vps_id}] Starting tmate SSH session...")
-    sock = "/tmp/tmate.sock"
-    ct.exec_run(f"bash -c 'rm -f {sock}; tmate -S {sock} new-session -d'", tty=False)
-    time.sleep(5)
-    ct.exec_run(f"bash -c 'tmate -S {sock} wait tmate-ready'", tty=False)
-    r   = ct.exec_run(f"bash -c \"tmate -S {sock} display -p '#{{tmate_ssh}}'\"", tty=False)
-    ssh = r.output.decode(errors="ignore").strip() if r.output else ""
-    log.info(f"[{vps_id}] tmate SSH ready: {ssh}")
+    # ── Step 10: tmate SSH session (backup — 45s timeout so it never hangs) ──
+    log.info(f"[{vps_id}] Starting tmate backup SSH session (timeout=45s)...")
+    ssh = ""
+    try:
+        sock = "/tmp/tmate.sock"
+        ct.exec_run(f"bash -c 'rm -f {sock}; tmate -S {sock} new-session -d'", tty=False)
+
+        def _wait_tmate():
+            ct.exec_run(f"bash -c 'tmate -S {sock} wait tmate-ready'", tty=False)
+            res = ct.exec_run(
+                f"bash -c \"tmate -S {sock} display -p '#{{tmate_ssh}}'\"", tty=False
+            )
+            return res.output.decode(errors="ignore").strip() if res.output else ""
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_wait_tmate)
+            try:
+                ssh = fut.result(timeout=45)
+                log.info(f"[{vps_id}] tmate SSH ready: {ssh}")
+            except concurrent.futures.TimeoutError:
+                log.warning(f"[{vps_id}] tmate timed out after 45s — skipping backup SSH (direct SSH still works)")
+    except Exception as e:
+        log.warning(f"[{vps_id}] tmate failed: {e} — skipping backup SSH")
 
     return ct, ssh
 
@@ -665,10 +682,19 @@ def regen_ssh(ct) -> str:
     ct.exec_run("bash -c 'pkill tmate; rm -f /tmp/tmate.sock'", tty=False)
     time.sleep(2)
     ct.exec_run(f"bash -c 'tmate -S {sock} new-session -d'", tty=False)
-    time.sleep(5)
-    ct.exec_run(f"bash -c 'tmate -S {sock} wait tmate-ready'", tty=False)
-    r = ct.exec_run(f"bash -c \"tmate -S {sock} display -p '#{{tmate_ssh}}'\"", tty=False)
-    return r.output.decode(errors="ignore").strip() if r.output else ""
+
+    def _wait():
+        ct.exec_run(f"bash -c 'tmate -S {sock} wait tmate-ready'", tty=False)
+        r = ct.exec_run(f"bash -c \"tmate -S {sock} display -p '#{{tmate_ssh}}'\"", tty=False)
+        return r.output.decode(errors="ignore").strip() if r.output else ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_wait)
+        try:
+            return fut.result(timeout=45)
+        except concurrent.futures.TimeoutError:
+            log.warning("regen_ssh: tmate timed out after 45s")
+            return ""
 
 
 def get_stats(ct, ram_mb=0, cores=0) -> dict:
