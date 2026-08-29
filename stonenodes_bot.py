@@ -856,35 +856,80 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
     except discord.Forbidden:
         log.warning(f"Cannot DM {user}")
 
+    # ── Public channel notification ───────────────────────────────────
+    channel_sent = False
+    try:
+        ch = ix.channel or bot.get_channel(ix.channel_id)
+        if ch:
+            await ch.send(embed=em(
+                "✅ VPS Ready",
+                f"{user.mention} your VPS **`{vps_id}`** is live!\n"
+                f"📬 Check your **DMs** for SSH credentials.",
+                GREEN,
+                fields=[
+                    ("Instance ID", f"`{vps_id}`",            True),
+                    ("OS",          os_label,                  True),
+                    ("Node",        node_id or "N1",           True),
+                ],
+            ))
+            channel_sent = True
+    except Exception as e:
+        log.warning(f"Channel notification failed: {e}")
+
+    # ── Check if SSH port is reachable — warn user in DM if blocked ───
+    def _check_port(ip, port, timeout=5):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                return s.connect_ex((ip, port)) == 0
+        except Exception:
+            return False
+
+    port_open = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: _check_port(ssh_ip, host_port)
+    )
+
+    if not port_open and dm_ok:
+        try:
+            dm = await user.create_dm()
+            await dm.send(embed=em(
+                "⚠️ SSH Port May Be Blocked",
+                f"The bot tested port `{host_port}` on `{ssh_ip}` and it did **not respond**.\n\n"
+                f"Your VPS is running — but you won't be able to connect until the port is unblocked.\n\n"
+                f"**Ask your admin to run on the bot server:**\n"
+                f"```bash\n"
+                f"sudo ufw allow 20000:29999/tcp\n"
+                f"sudo ufw reload\n"
+                f"```\n"
+                f"Also open **TCP ports 20000–29999** in the cloud provider's Security Group / Firewall.\n\n"
+                f"Once done, try connecting again:\n"
+                f"```\nssh root@{ssh_ip} -p {host_port}\n```",
+                YELLOW,
+            ))
+        except Exception:
+            pass
+    elif not port_open:
+        log.warning(f"[{vps_id}] SSH port {host_port} not reachable from bot — user should check firewall")
+
     note = "✅ SSH sent to DM." if dm_ok else "⚠️ Could not DM — share SSH manually."
+    if not port_open:
+        note += " ⚠️ SSH port may be blocked — see firewall warning in DM."
+
     await ix.followup.send(embed=em(
         "✅ VPS Created",
         f"**{vps_id}** is live for {user.mention}\n{note}",
-        GREEN,
+        GREEN if port_open else YELLOW,
         fields=[
-            ("🆔 VPS ID", vps_id,            True),
-            ("👤 Owner",  str(user),          True),
-            ("🖥 OS",     os_label,           True),
-            ("🧠 RAM",    f"{ram} MB",        True),
-            ("💻 CPU",    f"{cpu} Core(s)",   True),
-            ("💾 Disk",   f"{disk} GB",       True),
-            ("⏰ Expiry", exp_note,           False),
+            ("🆔 VPS ID",    vps_id,          True),
+            ("👤 Owner",     str(user),        True),
+            ("🖥 OS",        os_label,         True),
+            ("🧠 RAM",       f"{ram} MB",      True),
+            ("💻 CPU",       f"{cpu} Core(s)", True),
+            ("🌐 SSH Port",  f"`{host_port}`", True),
+            ("🔌 Port Open", "✅ Yes" if port_open else "❌ No — firewall needed", True),
+            ("⏰ Expiry",    exp_note,         False),
         ],
     ))
-
-    if ix.channel:
-        await ix.channel.send(embed=em(
-            "🐉 VPS Provisioned",
-            f"{user.mention} your **{vps_id}** is ready!\nCheck your **DMs** for the SSH command.",
-            BLUE,
-            fields=[
-                ("🆔 VPS ID", vps_id,          True),
-                ("🖥 OS",     os_label,         True),
-                ("🧠 RAM",    f"{ram} MB",      True),
-                ("💻 CPU",    f"{cpu} Core(s)", True),
-                ("💾 Disk",   f"{disk} GB",     True),
-            ],
-        ))
 
 # ─────────────────────────────────────────────────────
 # BOT
