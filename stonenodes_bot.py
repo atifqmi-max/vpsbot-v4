@@ -638,23 +638,48 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     # ── Step 9: Root password + direct SSH login ─────────────────────
     log.info(f"[{vps_id}] Setting root password and enabling SSH...")
+
+    # Set root password
     ct.exec_run(f"bash -c \"echo 'root:{root_pass}' | chpasswd\"", tty=False)
-    ct.exec_run("mkdir -p /run/sshd", tty=False)
+
+    # Create ALL directories sshd needs (missing these = "end of file" error)
+    ct.exec_run("mkdir -p /run/sshd /var/run/sshd /etc/ssh", tty=False)
+
+    # Generate SSH host keys (critical — without these sshd closes immediately)
+    r = ct.exec_run("ssh-keygen -A", tty=False)
+    log.info(f"[{vps_id}] ssh-keygen -A exit={r.exit_code}")
+
+    # Enable root login + password auth in sshd_config
     ct.exec_run(
         "bash -c \""
         "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; "
         "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; "
-        "grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; "
+        "sed -i 's/^#\\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config; "
+        "grep -q '^PermitRootLogin' /etc/ssh/sshd_config     || echo 'PermitRootLogin yes'     >> /etc/ssh/sshd_config; "
         "grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config"
         "\"",
         tty=False,
     )
+
+    # Start sshd — try systemctl first, fall back to direct sshd binary
     r = ct.exec_run(
-        "bash -c 'systemctl enable ssh 2>/dev/null; systemctl restart ssh "
-        "|| systemctl restart sshd || service ssh restart'",
+        "bash -c 'systemctl enable ssh 2>/dev/null; systemctl restart ssh 2>/dev/null "
+        "|| systemctl restart sshd 2>/dev/null "
+        "|| service ssh restart 2>/dev/null "
+        "|| /usr/sbin/sshd'",
         tty=False,
     )
     log.info(f"[{vps_id}] sshd restart exit={r.exit_code}")
+
+    # Verify sshd is actually listening
+    time.sleep(2)
+    r2 = ct.exec_run("bash -c 'ss -tlnp | grep :22 || netstat -tlnp | grep :22'", tty=False)
+    sshd_up = r2.output and b":22" in r2.output
+    log.info(f"[{vps_id}] sshd listening on :22 = {sshd_up}")
+    if not sshd_up:
+        # Last resort — start sshd directly in background
+        ct.exec_run("bash -c '/usr/sbin/sshd -D &'", tty=False)
+        log.info(f"[{vps_id}] Forced direct /usr/sbin/sshd -D")
 
     # ── Step 10: tmate SSH session (backup — 45s timeout so it never hangs) ──
     log.info(f"[{vps_id}] Starting tmate backup SSH session (timeout=45s)...")
