@@ -574,21 +574,27 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     # ── Step 4: Wait for systemd to fully boot ───────────────────────
     log.info(f"[{vps_id}] Waiting for systemd to initialize...")
-    time.sleep(8)
+    time.sleep(6)
 
-    # ── Step 5: apt update ───────────────────────────────────────────
-    log.info(f"[{vps_id}] Running apt update...")
-    ct.exec_run("bash -c 'apt-get update -qq'", tty=False)
-
-    # ── Step 6: Install packages ─────────────────────────────────────
-    log.info(f"[{vps_id}] Installing openssh-server, tmate, neofetch, tools...")
-    ct.exec_run("bash -c 'apt-get update -qq'", tty=False, socket=False)
-    ct.exec_run(
+    # ── Step 5: Install only what we NEED — no apt update/upgrade ────
+    # Skipping apt update saves 60-120 seconds. The base images already
+    # have openssh-server and tmate available in their local apt cache.
+    log.info(f"[{vps_id}] Installing openssh-server + tmate (no update)...")
+    r = ct.exec_run(
         "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
         "--no-install-recommends "
-        "openssh-server tmate neofetch curl wget sudo procps net-tools iproute2 htop'",
+        "openssh-server tmate procps net-tools 2>&1 | tail -3'",
         tty=False,
     )
+    # If install failed due to stale cache, do a minimal update and retry
+    if r.exit_code and r.exit_code != 0:
+        log.info(f"[{vps_id}] apt cache stale, running update then retry...")
+        ct.exec_run("bash -c 'apt-get update -qq 2>&1 | tail -3'", tty=False)
+        ct.exec_run(
+            "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+            "--no-install-recommends openssh-server tmate procps net-tools'",
+            tty=False,
+        )
 
     # ── Step 7: Fake /proc/meminfo and /proc/cpuinfo ─────────────────
     ct.exec_run("mkdir -p /etc/stonenodes", tty=False)
@@ -831,18 +837,19 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
     cpu_disp = f"{cpu:g}" if float(cpu) == int(cpu) else f"{cpu}"
     direct_ssh_cmd = f"ssh root@{ssh_ip} -p {host_port}"
 
-    # DM user credentials — TaproCloud-style "your VPS is ready" card
+    # ── Send DM ───────────────────────────────────────────────────────
     dm_ok = False
     try:
+        log.info(f"[{vps_id}] Sending DM to {user}...")
         fields = [
-            ("Instance ID",     f"`{vps_id}`",                    True),
-            ("OS",               os_label,                        True),
-            ("RAM / CPU",        f"{ram_disp} / {cpu_disp} vCPU",  True),
-            ("Shared IPv4",      f"`{ssh_ip}`",                    True),
-            ("SSH Port (NAT)",   f"`{host_port}`",                 True),
-            ("Username",         "`root`",                        True),
-            ("Root Password",    f"```{root_pass}```",             False),
-            ("SSH Command",      f"```{direct_ssh_cmd}```",        False),
+            ("Instance ID",   f"`{vps_id}`",                   True),
+            ("OS",             os_label,                        True),
+            ("RAM / CPU",      f"{ram_disp} / {cpu_disp} vCPU", True),
+            ("Shared IPv4",    f"`{ssh_ip}`",                   True),
+            ("SSH Port (NAT)", f"`{host_port}`",                True),
+            ("Username",       "`root`",                        True),
+            ("Root Password",  f"```{root_pass}```",            False),
+            ("SSH Command",    f"```{direct_ssh_cmd}```",       False),
         ]
         if exp_at: fields.append(("⏰ Expiry", exp_note, False))
         dm = await user.create_dm()
@@ -853,11 +860,13 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
             GREEN, fields=fields,
         ))
         dm_ok = True
+        log.info(f"[{vps_id}] DM sent to {user}")
     except discord.Forbidden:
-        log.warning(f"Cannot DM {user}")
+        log.warning(f"[{vps_id}] Cannot DM {user} — DMs disabled")
+    except Exception as e:
+        log.error(f"[{vps_id}] DM send failed: {e}")
 
     # ── Public channel notification ───────────────────────────────────
-    channel_sent = False
     try:
         ch = ix.channel or bot.get_channel(ix.channel_id)
         if ch:
@@ -867,69 +876,79 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
                 f"📬 Check your **DMs** for SSH credentials.",
                 GREEN,
                 fields=[
-                    ("Instance ID", f"`{vps_id}`",            True),
-                    ("OS",          os_label,                  True),
-                    ("Node",        node_id or "N1",           True),
+                    ("Instance ID", f"`{vps_id}`",   True),
+                    ("OS",          os_label,          True),
+                    ("Node",        node_id or "N1",   True),
                 ],
             ))
-            channel_sent = True
+            log.info(f"[{vps_id}] Channel notification sent")
+        else:
+            log.warning(f"[{vps_id}] ix.channel is None — channel notification skipped")
     except Exception as e:
-        log.warning(f"Channel notification failed: {e}")
+        log.error(f"[{vps_id}] Channel notification failed: {e}")
 
-    # ── Check if SSH port is reachable — warn user in DM if blocked ───
-    def _check_port(ip, port, timeout=5):
-        try:
+    # ── SSH port reachability check (quick, non-blocking) ─────────────
+    port_open = False
+    try:
+        def _check_port(ip, port, timeout=5):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(timeout)
                 return s.connect_ex((ip, port)) == 0
-        except Exception:
-            return False
+        loop = asyncio.get_running_loop()
+        port_open = await loop.run_in_executor(None, lambda: _check_port(ssh_ip, host_port))
+        log.info(f"[{vps_id}] SSH port {host_port} reachable: {port_open}")
+    except Exception as e:
+        log.warning(f"[{vps_id}] Port check failed: {e}")
 
-    port_open = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: _check_port(ssh_ip, host_port)
-    )
-
-    if not port_open and dm_ok:
+    if not port_open:
         try:
             dm = await user.create_dm()
             await dm.send(embed=em(
                 "⚠️ SSH Port May Be Blocked",
-                f"The bot tested port `{host_port}` on `{ssh_ip}` and it did **not respond**.\n\n"
-                f"Your VPS is running — but you won't be able to connect until the port is unblocked.\n\n"
-                f"**Ask your admin to run on the bot server:**\n"
+                f"Port `{host_port}` on `{ssh_ip}` is **not responding**.\n\n"
+                f"Your VPS is running — ask your admin to open the firewall:\n"
                 f"```bash\n"
-                f"sudo ufw allow 20000:29999/tcp\n"
-                f"sudo ufw reload\n"
+                f"sudo ufw allow 20000:29999/tcp && sudo ufw reload\n"
                 f"```\n"
-                f"Also open **TCP ports 20000–29999** in the cloud provider's Security Group / Firewall.\n\n"
-                f"Once done, try connecting again:\n"
-                f"```\nssh root@{ssh_ip} -p {host_port}\n```",
+                f"Also open `20000-29999` TCP in your cloud provider's Security Group.\n\n"
+                f"Then retry:\n```\n{direct_ssh_cmd}\n```",
                 YELLOW,
             ))
         except Exception:
             pass
-    elif not port_open:
-        log.warning(f"[{vps_id}] SSH port {host_port} not reachable from bot — user should check firewall")
 
-    note = "✅ SSH sent to DM." if dm_ok else "⚠️ Could not DM — share SSH manually."
+    # ── Admin ephemeral followup ───────────────────────────────────────
+    note = "✅ DM sent." if dm_ok else "⚠️ Could not DM user."
     if not port_open:
-        note += " ⚠️ SSH port may be blocked — see firewall warning in DM."
-
-    await ix.followup.send(embed=em(
-        "✅ VPS Created",
-        f"**{vps_id}** is live for {user.mention}\n{note}",
-        GREEN if port_open else YELLOW,
-        fields=[
-            ("🆔 VPS ID",    vps_id,          True),
-            ("👤 Owner",     str(user),        True),
-            ("🖥 OS",        os_label,         True),
-            ("🧠 RAM",       f"{ram} MB",      True),
-            ("💻 CPU",       f"{cpu} Core(s)", True),
-            ("🌐 SSH Port",  f"`{host_port}`", True),
-            ("🔌 Port Open", "✅ Yes" if port_open else "❌ No — firewall needed", True),
-            ("⏰ Expiry",    exp_note,         False),
-        ],
-    ))
+        note += " ❌ SSH port blocked — firewall needed."
+    try:
+        await ix.followup.send(embed=em(
+            "✅ VPS Created",
+            f"**{vps_id}** is live for {user.mention}\n{note}",
+            GREEN if (dm_ok and port_open) else YELLOW,
+            fields=[
+                ("🆔 VPS ID",    vps_id,          True),
+                ("👤 Owner",     str(user),        True),
+                ("🖥 OS",        os_label,         True),
+                ("🧠 RAM",       f"{ram} MB",      True),
+                ("💻 CPU",       f"{cpu} Core(s)", True),
+                ("🌐 SSH Port",  f"`{host_port}`", True),
+                ("🔌 Port Open", "✅ Yes" if port_open else "❌ No — open firewall", True),
+                ("⏰ Expiry",    exp_note,         False),
+            ],
+        ))
+    except Exception as e:
+        log.error(f"[{vps_id}] Final followup.send failed: {e}")
+        # Fallback — try channel if followup expired
+        try:
+            ch = ix.channel or bot.get_channel(ix.channel_id)
+            if ch:
+                await ch.send(
+                    content=f"{ix.user.mention} ✅ **{vps_id}** created for {user.mention}. "
+                            f"SSH sent to their DM.",
+                )
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────
 # BOT
