@@ -13,7 +13,7 @@
 """
 
 import os, io, time, socket, random, string, secrets, uuid, tarfile, asyncio, logging, sqlite3, datetime
-import concurrent.futures
+import concurrent.futures, subprocess, ipaddress
 import discord, docker, psutil, requests, aiohttp
 from aiohttp import web
 from discord import app_commands
@@ -45,6 +45,11 @@ SSH_PORT_END   = int(os.getenv("SSH_PORT_END", "29999"))
 # Remote nodes connect OUTBOUND to ws://SERVER_IP:AGENT_PORT/agent/ws
 # Open this port in your firewall (same as the SSH port range).
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8788"))
+
+# Docker network — gives each VPS its own unique IP (172.30.0.10, .11, .12 ...)
+VPS_SUBNET    = os.getenv("VPS_SUBNET",   "172.30.0.0/24")
+VPS_IP_START  = int(os.getenv("VPS_IP_START", "10"))   # first usable offset
+NETWORK_NAME  = "stonenodes-net"
 
 # ─────────────────────────────────────────────────────
 # LOGGING
@@ -147,11 +152,12 @@ def init_db():
         # Backfill columns for DBs created before this update
         cols = {row["name"] for row in c.execute("PRAGMA table_info(vps)").fetchall()}
         for col, ddl in [
-            ("ssh_ip",    "ALTER TABLE vps ADD COLUMN ssh_ip TEXT DEFAULT ''"),
-            ("ssh_port",  "ALTER TABLE vps ADD COLUMN ssh_port INTEGER DEFAULT NULL"),
-            ("root_pass", "ALTER TABLE vps ADD COLUMN root_pass TEXT DEFAULT ''"),
-            ("username",  "ALTER TABLE vps ADD COLUMN username TEXT DEFAULT 'root'"),
-            ("node_id",   "ALTER TABLE vps ADD COLUMN node_id TEXT DEFAULT NULL"),
+            ("ssh_ip",       "ALTER TABLE vps ADD COLUMN ssh_ip TEXT DEFAULT ''"),
+            ("ssh_port",     "ALTER TABLE vps ADD COLUMN ssh_port INTEGER DEFAULT NULL"),
+            ("root_pass",    "ALTER TABLE vps ADD COLUMN root_pass TEXT DEFAULT ''"),
+            ("username",     "ALTER TABLE vps ADD COLUMN username TEXT DEFAULT 'root'"),
+            ("node_id",      "ALTER TABLE vps ADD COLUMN node_id TEXT DEFAULT NULL"),
+            ("container_ip", "ALTER TABLE vps ADD COLUMN container_ip TEXT DEFAULT NULL"),
         ]:
             if col not in cols:
                 c.execute(ddl)
@@ -200,6 +206,62 @@ def find_free_port_for_node(node_id: str) -> int:
 def gen_redeem_code() -> str:
     part = lambda: "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
     return f"SN-{part()}-{part()}-{part()}"
+
+
+# ─────────────────────────────────────────────────────
+# DOCKER NETWORK — unique IP per VPS
+# ─────────────────────────────────────────────────────
+def ensure_vps_network():
+    """Create the stonenodes-net Docker bridge network if it doesn't exist."""
+    client = get_docker()
+    try:
+        return client.networks.get(NETWORK_NAME)
+    except docker.errors.NotFound:
+        ipam_pool   = docker.types.IPAMPool(subnet=VPS_SUBNET)
+        ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
+        net = client.networks.create(
+            NETWORK_NAME,
+            driver="bridge",
+            ipam=ipam_config,
+            options={"com.docker.network.bridge.enable_ip_masquerade": "true"},
+        )
+        # Enable IP forwarding so containers can reach the internet
+        subprocess.run("echo 1 > /proc/sys/net/ipv4/ip_forward",
+                       shell=True, capture_output=True)
+        log.info(f"Created Docker network {NETWORK_NAME} ({VPS_SUBNET})")
+        return net
+
+
+def next_container_ip() -> str:
+    """Return the next free IP address in VPS_SUBNET."""
+    with get_db() as c:
+        used = {r["container_ip"] for r in
+                c.execute("SELECT container_ip FROM vps WHERE container_ip IS NOT NULL").fetchall()}
+    net   = ipaddress.ip_network(VPS_SUBNET, strict=False)
+    hosts = list(net.hosts())
+    for host in hosts[VPS_IP_START - 1:]:
+        ip = str(host)
+        if ip not in used:
+            return ip
+    raise RuntimeError("No more IPs available in VPS subnet.")
+
+
+def open_port_firewall(port: int):
+    """Add an iptables rule to allow inbound TCP on this port (fixes connection timeout)."""
+    try:
+        subprocess.run(
+            ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"],
+            capture_output=True,
+        )
+    except Exception:
+        pass
+    subprocess.run(
+        ["iptables", "-I", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"],
+        capture_output=True,
+    )
+    log.info(f"iptables: opened TCP port {port}")
+
+
 
 # ─────────────────────────────────────────────────────
 # EMBED HELPER
@@ -263,7 +325,7 @@ async def send_job_to_node(node_id: str, job: dict, timeout: int = 180) -> dict:
         raise RuntimeError(f"Node '{node_id}' is offline.")
     job_id = str(uuid.uuid4())
     job["job_id"] = job_id
-    fut = asyncio.get_event_loop().create_future()
+    fut = asyncio.get_running_loop().create_future()
     PENDING_JOBS[job_id] = fut
     try:
         await ws.send_json(job)
@@ -465,24 +527,20 @@ def write_file(ct, path: str, content: str):
 # CORE VPS PROVISION
 # ─────────────────────────────────────────────────────
 def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
-              host_port, root_pass) -> tuple:
+              host_port, root_pass, container_ip=None) -> tuple:
     """
     Creates a Docker VPS with full systemd support.
 
-    KEY: Uses Docker low-level API with CgroupnsMode=host
-    This is the only reliable way to run systemd inside Docker
-    on cgroup v2 hosts without the threaded-mode error.
-
     Steps:
       1. Pull jrei/systemd image
-      2. Create container via low-level API (CgroupnsMode=host),
-         mapping container port 22 -> host_port
+      2. Create container on stonenodes-net (unique IP per VPS)
       3. Wait for systemd to boot
-      4. apt update + apt install openssh-server, tmate, neofetch
+      4. apt install openssh-server (no update — faster)
       5. Fake /proc/meminfo and /proc/cpuinfo
       6. Set hostname and MOTD
-      7. Set root password + enable password SSH login
-      8. Start tmate SSH session (kept as a backup access method)
+      7. Generate SSH host keys + enable password SSH login
+      8. Auto-open firewall port via iptables
+      9. Start tmate SSH session (45s timeout)
     """
     client  = get_docker()
     mem     = f"{ram_mb}m"
@@ -504,6 +562,15 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     except Exception as e:
         log.warning(f"[{vps_id}] Cleanup warning: {e}")
 
+    # ── Step 1: Ensure Docker network + assign unique container IP ─────
+    ensure_vps_network()
+    if container_ip is None:
+        container_ip = next_container_ip()
+    log.info(f"[{vps_id}] Assigned container IP: {container_ip}")
+
+    # Open firewall port BEFORE creating the container (fixes timeout)
+    open_port_firewall(host_port)
+
     # ── Step 2: Pull jrei/systemd image ─────────────────────────────
     log.info(f"[{vps_id}] Pulling {image}...")
     try:
@@ -516,11 +583,11 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         )
 
     # ── Step 3: Create container via low-level API ──────────────────
-    # We MUST use the low-level API to pass CgroupnsMode=host
-    # The high-level client.containers.run() doesn't support it.
-    # CgroupnsMode=host lets systemd manage cgroups without
-    # hitting the "threaded mode" error on cgroup v2 hosts.
     log.info(f"[{vps_id}] Creating container with CgroupnsMode=host...")
+
+    networking_cfg = client.api.create_networking_config({
+        NETWORK_NAME: client.api.create_endpoint_config(ipv4_address=container_ip)
+    })
 
     try:
         host_cfg = client.api.create_host_config(
@@ -539,7 +606,6 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
             port_bindings={22: host_port},
         )
     except TypeError:
-        # Older docker-py doesn't have cgroupns param — try without
         log.warning(f"[{vps_id}] cgroupns not supported in this docker-py, trying without...")
         host_cfg = client.api.create_host_config(
             mem_limit=mem,
@@ -565,12 +631,13 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         environment={"TERM": "xterm-256color", "container": "docker"},
         command="/sbin/init",
         host_config=host_cfg,
+        networking_config=networking_cfg,
         ports=[22],
         labels={"managed-by": "stonenodes", "vps-id": vps_id},
     )
     client.api.start(ct_data["Id"])
     ct = client.containers.get(ct_data["Id"])
-    log.info(f"[{vps_id}] Container started: {ct.short_id}")
+    log.info(f"[{vps_id}] Container started: {ct.short_id} | IP: {container_ip}")
 
     # ── Step 4: Wait for systemd to fully boot ───────────────────────
     log.info(f"[{vps_id}] Waiting for systemd to initialize...")
@@ -705,7 +772,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     except Exception as e:
         log.warning(f"[{vps_id}] tmate failed: {e} — skipping backup SSH")
 
-    return ct, ssh
+    return ct, ssh, container_ip
 
 
 def regen_ssh(ct) -> str:
@@ -805,8 +872,9 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
         ],
     ))
 
-    root_pass = gen_root_password()
-    ssh_ip    = SERVER_IP
+    root_pass    = gen_root_password()
+    ssh_ip       = SERVER_IP
+    container_ip = None
 
     try:
         if node_id:
@@ -821,13 +889,15 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
                 raise RuntimeError(result.get("error", "Unknown node error"))
             container_id = result.get("container_id", "")
             ssh          = result.get("ssh", "")
-            host_port    = result.get("host_port", host_port)  # node may reassign if taken
+            container_ip = result.get("container_ip", "")
+            host_port    = result.get("host_port", host_port)
             with get_db() as c:
                 row = c.execute("SELECT public_ip FROM nodes WHERE node_id=?", (node_id,)).fetchone()
                 ssh_ip = row["public_ip"] if row and row["public_ip"] else SERVER_IP
         else:
             host_port = find_free_port()
-            ct, ssh = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            ct, ssh, container_ip = await loop.run_in_executor(
                 None, lambda: provision(vps_id, image, os_label, ram, cpu, disk, cpu_name,
                                          host_port, root_pass)
             )
@@ -849,11 +919,11 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
             INSERT INTO vps
               (vps_id,owner_id,container_id,os_image,os_label,
                ram_mb,cpu_cores,disk_gb,cpu_name,ssh_cmd,
-               ssh_ip,ssh_port,root_pass,username,status,expires_at,node_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'root','running',?,?)
+               ssh_ip,ssh_port,root_pass,username,status,expires_at,node_id,container_ip)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'root','running',?,?,?)
         """, (vps_id, user.id, container_id, image, os_label,
               ram, cpu, disk, cpu_name, ssh,
-              ssh_ip, host_port, root_pass, exp_at, node_id))
+              ssh_ip, host_port, root_pass, exp_at, node_id, container_ip))
 
     log.info(f"Created {vps_id} for {user} by {ix.user} on node={node_id or 'local'}")
 
@@ -873,6 +943,11 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
             ("Shared IPv4",    f"`{ssh_ip}`",                   True),
             ("SSH Port (NAT)", f"`{host_port}`",                True),
             ("Username",       "`root`",                        True),
+        ]
+        if container_ip:
+            fields.append(("VPS Internal IP", f"`{container_ip}`", True))
+            fields.append(("SSH Port (Internal)", "`22`",          True))
+        fields += [
             ("Root Password",  f"```{root_pass}```",            False),
             ("SSH Command",    f"```{direct_ssh_cmd}```",       False),
         ]
@@ -1133,7 +1208,7 @@ async def cmd_reinstall(ix: discord.Interaction, vps_id: str):
         host_port = row["ssh_port"] or find_free_port()
         root_pass = gen_root_password()
 
-        ct, ssh = await asyncio.get_event_loop().run_in_executor(
+        ct, ssh = await asyncio.get_running_loop().run_in_executor(
             None, lambda: provision(vps_id, row["os_image"], row["os_label"],
                                     row["ram_mb"], row["cpu_cores"], row["disk_gb"], row["cpu_name"],
                                     host_port, root_pass)
@@ -1172,7 +1247,7 @@ async def cmd_regen(ix: discord.Interaction, vps_id: str):
         return await ix.followup.send(embed=em("⚠️ Not Running", f"Start first: `/start {vps_id}`", YELLOW))
     try:
         ct  = get_docker().containers.get(row["container_id"])
-        ssh = await asyncio.get_event_loop().run_in_executor(None, lambda: regen_ssh(ct))
+        ssh = await asyncio.get_running_loop().run_in_executor(None, lambda: regen_ssh(ct))
         if not ssh:
             return await ix.followup.send(embed=em("⚠️ Not Ready", "Try again in 15 seconds.", YELLOW))
         with get_db() as c: c.execute("UPDATE vps SET ssh_cmd=? WHERE vps_id=?", (ssh, vps_id))
