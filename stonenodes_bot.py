@@ -202,6 +202,18 @@ def gen_redeem_code() -> str:
     return f"SN-{part()}-{part()}-{part()}"
 
 
+def open_port_firewall(port: int):
+    """Auto-open this port in iptables so SSH doesn't time out."""
+    try:
+        subprocess.run(
+            ["iptables", "-I", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"],
+            capture_output=True, check=False,
+        )
+        log.info(f"iptables: opened port {port}")
+    except Exception as e:
+        log.warning(f"iptables open failed (non-fatal): {e}")
+
+
 
 # ─────────────────────────────────────────────────────
 # EMBED HELPER
@@ -504,6 +516,9 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     # ── Step 2: Pull jrei/systemd image ─────────────────────────────
     log.info(f"[{vps_id}] Pulling {image}...")
+
+    # Auto-open firewall port so users can connect without manual steps
+    open_port_firewall(host_port)
     try:
         client.images.pull(image)
         log.info(f"[{vps_id}] Image ready: {image}")
