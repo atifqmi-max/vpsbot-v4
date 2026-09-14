@@ -677,34 +677,11 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     log.info(f"[{vps_id}] sshd listening on :22 = {sshd_up}")
     if not sshd_up:
         # Last resort — start sshd directly in background
-        ct.exec_run("bash -c '/usr/sbin/sshd -D &'", tty=False)
-        log.info(f"[{vps_id}] Forced direct /usr/sbin/sshd -D")
+        ct.exec_run("bash -c '/usr/sbin/sshd'", tty=False)
+        log.info(f"[{vps_id}] Forced direct /usr/sbin/sshd")
 
-    # ── Step 10: tmate SSH session (backup — 45s timeout so it never hangs) ──
-    log.info(f"[{vps_id}] Starting tmate backup SSH session (timeout=45s)...")
-    ssh = ""
-    try:
-        sock = "/tmp/tmate.sock"
-        ct.exec_run(f"bash -c 'rm -f {sock}; tmate -S {sock} new-session -d'", tty=False)
-
-        def _wait_tmate():
-            ct.exec_run(f"bash -c 'tmate -S {sock} wait tmate-ready'", tty=False)
-            res = ct.exec_run(
-                f"bash -c \"tmate -S {sock} display -p '#{{tmate_ssh}}'\"", tty=False
-            )
-            return res.output.decode(errors="ignore").strip() if res.output else ""
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_wait_tmate)
-            try:
-                ssh = fut.result(timeout=45)
-                log.info(f"[{vps_id}] tmate SSH ready: {ssh}")
-            except concurrent.futures.TimeoutError:
-                log.warning(f"[{vps_id}] tmate timed out after 45s — skipping backup SSH (direct SSH still works)")
-    except Exception as e:
-        log.warning(f"[{vps_id}] tmate failed: {e} — skipping backup SSH")
-
-    return ct, ssh
+    log.info(f"[{vps_id}] ✅ Provision complete — direct SSH ready on port {host_port}")
+    return ct, ""
 
 
 def regen_ssh(ct) -> str:
