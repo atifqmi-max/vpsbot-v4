@@ -635,53 +635,65 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         f"  ╚══════════════════════════════════╝\n\n"
     )
 
-    # ── Step 9: Root password + direct SSH login ─────────────────────
-    log.info(f"[{vps_id}] Setting root password and enabling SSH...")
+    # ── Step 9: Root password + bulletproof SSH setup ────────────────
+    log.info(f"[{vps_id}] Setting root password and configuring SSH...")
 
     # Set root password
     ct.exec_run(f"bash -c \"echo 'root:{root_pass}' | chpasswd\"", tty=False)
 
-    # Create ALL directories sshd needs (missing these = "end of file" error)
+    # Create required directories
     ct.exec_run("mkdir -p /run/sshd /var/run/sshd /etc/ssh", tty=False)
 
-    # Generate SSH host keys (critical — without these sshd closes immediately)
+    # Generate SSH host keys
     r = ct.exec_run("ssh-keygen -A", tty=False)
     log.info(f"[{vps_id}] ssh-keygen -A exit={r.exit_code}")
 
-    # Enable root login + password auth in sshd_config
-    ct.exec_run(
-        "bash -c \""
-        "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; "
-        "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; "
-        "sed -i 's/^#\\?UsePAM.*/UsePAM no/' /etc/ssh/sshd_config; "
-        "sed -i 's/^#\\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config; "
-        "grep -q '^PermitRootLogin' /etc/ssh/sshd_config     || echo 'PermitRootLogin yes'              >> /etc/ssh/sshd_config; "
-        "grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config; "
-        "grep -q '^UsePAM' /etc/ssh/sshd_config               || echo 'UsePAM no'                      >> /etc/ssh/sshd_config; "
-        "grep -q '^ChallengeResponseAuthentication' /etc/ssh/sshd_config || echo 'ChallengeResponseAuthentication no' >> /etc/ssh/sshd_config"
-        "\"",
-        tty=False,
+    # Write a fresh minimal sshd_config — avoids ALL sed/config corruption issues
+    # UsePrivilegeSeparation no is CRITICAL for Docker containers
+    sshd_config = (
+        "Port 22\n"
+        "Protocol 2\n"
+        "HostKey /etc/ssh/ssh_host_rsa_key\n"
+        "HostKey /etc/ssh/ssh_host_ecdsa_key\n"
+        "HostKey /etc/ssh/ssh_host_ed25519_key\n"
+        "UsePrivilegeSeparation no\n"
+        "PermitRootLogin yes\n"
+        "PasswordAuthentication yes\n"
+        "ChallengeResponseAuthentication no\n"
+        "UsePAM no\n"
+        "X11Forwarding no\n"
+        "PrintMotd yes\n"
+        "AcceptEnv LANG LC_*\n"
+        "Subsystem sftp /usr/lib/openssh/sftp-server\n"
     )
+    write_file(ct, "/etc/ssh/sshd_config", sshd_config)
 
-    # Start sshd — try systemctl first, fall back to direct sshd binary
+    # Test config validity before starting
+    r = ct.exec_run("sshd -t", tty=False)
+    log.info(f"[{vps_id}] sshd config test exit={r.exit_code} "
+             f"output={r.output.decode(errors='ignore').strip() if r.output else ''}")
+
+    # Start sshd — try systemctl first, fall back to direct binary
     r = ct.exec_run(
-        "bash -c 'systemctl enable ssh 2>/dev/null; systemctl restart ssh 2>/dev/null "
-        "|| systemctl restart sshd 2>/dev/null "
-        "|| service ssh restart 2>/dev/null "
-        "|| /usr/sbin/sshd'",
+        "bash -c '"
+        "systemctl restart ssh 2>/dev/null || "
+        "systemctl restart sshd 2>/dev/null || "
+        "service ssh restart 2>/dev/null || "
+        "/usr/sbin/sshd"
+        "'",
         tty=False,
     )
-    log.info(f"[{vps_id}] sshd restart exit={r.exit_code}")
+    log.info(f"[{vps_id}] sshd start exit={r.exit_code}")
 
-    # Verify sshd is actually listening
+    # Verify sshd is listening on port 22
     time.sleep(2)
     r2 = ct.exec_run("bash -c 'ss -tlnp | grep :22 || netstat -tlnp | grep :22'", tty=False)
     sshd_up = r2.output and b":22" in r2.output
     log.info(f"[{vps_id}] sshd listening on :22 = {sshd_up}")
     if not sshd_up:
-        # Last resort — start sshd directly in background
-        ct.exec_run("bash -c '/usr/sbin/sshd'", tty=False)
-        log.info(f"[{vps_id}] Forced direct /usr/sbin/sshd")
+        ct.exec_run("/usr/sbin/sshd", tty=False)
+        time.sleep(1)
+        log.info(f"[{vps_id}] Forced /usr/sbin/sshd")
 
     log.info(f"[{vps_id}] ✅ Provision complete — direct SSH ready on port {host_port}")
     return ct, ""
