@@ -653,9 +653,12 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         "bash -c \""
         "sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; "
         "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; "
-        "sed -i 's/^#\\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config; "
-        "grep -q '^PermitRootLogin' /etc/ssh/sshd_config     || echo 'PermitRootLogin yes'     >> /etc/ssh/sshd_config; "
-        "grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config"
+        "sed -i 's/^#\\?UsePAM.*/UsePAM no/' /etc/ssh/sshd_config; "
+        "sed -i 's/^#\\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config; "
+        "grep -q '^PermitRootLogin' /etc/ssh/sshd_config     || echo 'PermitRootLogin yes'              >> /etc/ssh/sshd_config; "
+        "grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes'    >> /etc/ssh/sshd_config; "
+        "grep -q '^UsePAM' /etc/ssh/sshd_config               || echo 'UsePAM no'                      >> /etc/ssh/sshd_config; "
+        "grep -q '^ChallengeResponseAuthentication' /etc/ssh/sshd_config || echo 'ChallengeResponseAuthentication no' >> /etc/ssh/sshd_config"
         "\"",
         tty=False,
     )
