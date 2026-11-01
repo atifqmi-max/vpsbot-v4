@@ -1,0 +1,24 @@
+# Secrets — NEVER commit
+.env
+
+# Database + logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Node agent local config (contains node token)
+node_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
