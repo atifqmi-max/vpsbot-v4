@@ -1,0 +1,14 @@
+[Unit]
+Description=LashariHost VPS Manager Bot
+After=docker.service network.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vpsbot-v4
+ExecStart=/root/vpsbot-v4/venv/bin/python3 lasharihost_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
